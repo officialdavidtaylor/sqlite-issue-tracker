@@ -67,8 +67,10 @@ revision; stale writes fail without an audit event. Mutation IDs are unique and
 replays must contain an identical request.
 
 The checked-in database is never the live WAL database. `sit snapshot` creates
-a transactionally consistent compact copy, hashes that immutable copy, and
-writes its manifest. `sit verify` runs `PRAGMA integrity_check`.
+a transactionally consistent compact copy and hashes that immutable copy.
+Snapshot and manifest targets are canonicalized, locked across processes,
+prepared before publication, and rolled back together if installation fails.
+`sit verify` runs `PRAGMA integrity_check`.
 
 ## MVP boundary
 

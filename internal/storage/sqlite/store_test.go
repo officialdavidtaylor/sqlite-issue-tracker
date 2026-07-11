@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -203,6 +204,16 @@ func TestStore_BlocksLinksRejectCycles(t *testing.T) {
 	if err := store.AddLink(ctx, replay); err != nil {
 		t.Fatalf("AddLink() replay error = %v", err)
 	}
+	if err := store.RemoveLink(ctx, replay); !errors.Is(err, issue.ErrMutationCollision) {
+		t.Fatalf("RemoveLink() with link mutation ID error = %v, want ErrMutationCollision", err)
+	}
+	remaining, err := store.ListLinks(ctx, "A", "outgoing")
+	if err != nil {
+		t.Fatalf("ListLinks() after mutation collision error = %v", err)
+	}
+	if len(remaining) != 1 || remaining[0].TargetID != "B" {
+		t.Fatalf("link changed after mutation collision: %+v", remaining)
+	}
 	if err := store.RemoveLink(ctx, issue.LinkParams{MutationID: "unlink-1", SourceID: "A", TargetID: "B", Relationship: "blocks", Actor: "test"}); err != nil {
 		t.Fatalf("RemoveLink() error = %v", err)
 	}
@@ -307,5 +318,189 @@ func TestStore_HashesAndSnapshotDescribeExportedState(t *testing.T) {
 	}
 	if err := store.IntegrityCheck(ctx); err != nil {
 		t.Fatalf("IntegrityCheck() error = %v", err)
+	}
+}
+
+func TestStore_HashesUseOneReadGeneration(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	createTestIssue(t, store, "ISS-1", "create-1")
+	baseline, err := store.Hashes(ctx)
+	if err != nil {
+		t.Fatalf("Hashes() baseline error = %v", err)
+	}
+	writer, err := Open(ctx, store.path)
+	if err != nil {
+		t.Fatalf("Open() writer error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := writer.Close(); err != nil {
+			t.Errorf("writer Close() error = %v", err)
+		}
+	})
+	status := "closed"
+	var writeErr error
+	var once sync.Once
+	store.hashTableHook = func(table string) {
+		if table != "issues" {
+			return
+		}
+		once.Do(func() {
+			_, writeErr = writer.UpdateIssue(ctx, issue.UpdateParams{
+				MutationID:       "update-during-hash",
+				ID:               "ISS-1",
+				Status:           &status,
+				ExpectedRevision: 1,
+				Actor:            "writer",
+			})
+		})
+	}
+	observed, err := store.Hashes(ctx)
+	store.hashTableHook = nil
+	if err != nil {
+		t.Fatalf("Hashes() concurrent error = %v", err)
+	}
+	if writeErr != nil {
+		t.Fatalf("UpdateIssue() during hash error = %v", writeErr)
+	}
+	if observed != baseline {
+		t.Fatalf("Hashes() mixed generations: got %+v, want pre-update %+v", observed, baseline)
+	}
+	current, err := store.Hashes(ctx)
+	if err != nil {
+		t.Fatalf("Hashes() current error = %v", err)
+	}
+	if current == baseline {
+		t.Fatalf("Hashes() after update = %+v, want a new generation", current)
+	}
+}
+
+func TestStore_ExportSnapshotRejectsAliasedArtifacts(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	createTestIssue(t, store, "ISS-1", "create-1")
+	directory := t.TempDir()
+	other := filepath.Join(directory, "other.sqlite")
+	for name, paths := range map[string][2]string{
+		"same artifact path": {other, other},
+		"snapshot is live":   {store.path, filepath.Join(directory, "manifest.json")},
+		"manifest is live":   {other, store.path},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := store.ExportSnapshot(ctx, paths[0], paths[1]); err == nil {
+				t.Fatal("ExportSnapshot() alias error = nil")
+			}
+			if err := store.IntegrityCheck(ctx); err != nil {
+				t.Fatalf("live database damaged after rejected export: %v", err)
+			}
+		})
+	}
+	symlink := filepath.Join(directory, "live-symlink.sqlite")
+	if err := os.Symlink(store.path, symlink); err == nil {
+		if _, err := store.ExportSnapshot(ctx, other, symlink); err == nil {
+			t.Fatal("ExportSnapshot() symlink alias error = nil")
+		}
+	}
+	hardlink := filepath.Join(directory, "live-hardlink.sqlite")
+	if err := os.Link(store.path, hardlink); err == nil {
+		if _, err := store.ExportSnapshot(ctx, other, hardlink); err == nil {
+			t.Fatal("ExportSnapshot() hardlink alias error = nil")
+		}
+	}
+	if err := store.IntegrityCheck(ctx); err != nil {
+		t.Fatalf("live database integrity after alias tests: %v", err)
+	}
+}
+
+func TestPublishPair_RollsBackPartialInstallation(t *testing.T) {
+	directory := t.TempDir()
+	snapshotPath := filepath.Join(directory, "issues.sqlite")
+	manifestPath := filepath.Join(directory, "manifest.json")
+	newSnapshot := filepath.Join(directory, "new.sqlite")
+	newManifest := filepath.Join(directory, "new.json")
+	for path, contents := range map[string]string{
+		snapshotPath: "old snapshot",
+		manifestPath: "old manifest",
+		newSnapshot:  "new snapshot",
+		newManifest:  "new manifest",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	injected := errors.New("injected manifest install failure")
+	rename := func(oldPath, newPath string) error {
+		if oldPath == newManifest && newPath == manifestPath {
+			return injected
+		}
+		return os.Rename(oldPath, newPath)
+	}
+	if err := publishPair(newSnapshot, newManifest, snapshotPath, manifestPath, rename); !errors.Is(err, injected) {
+		t.Fatalf("publishPair() error = %v, want injected failure", err)
+	}
+	for path, expected := range map[string]string{
+		snapshotPath: "old snapshot",
+		manifestPath: "old manifest",
+	} {
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%s) error = %v", path, err)
+		}
+		if string(contents) != expected {
+			t.Fatalf("%s after rollback = %q, want %q", path, contents, expected)
+		}
+	}
+}
+
+func TestStore_ConcurrentSnapshotExportsPublishConsistentPair(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	createTestIssue(t, store, "ISS-1", "create-1")
+	second, err := Open(ctx, store.path)
+	if err != nil {
+		t.Fatalf("Open() second exporter error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := second.Close(); err != nil {
+			t.Errorf("second Close() error = %v", err)
+		}
+	})
+	directory := t.TempDir()
+	snapshotPath := filepath.Join(directory, "issues.sqlite")
+	manifestPath := filepath.Join(directory, "manifest.json")
+	start := make(chan struct{})
+	errorsByExporter := make(chan error, 2)
+	for _, exporter := range []*Store{store, second} {
+		go func(exporter *Store) {
+			<-start
+			_, err := exporter.ExportSnapshot(ctx, snapshotPath, manifestPath)
+			errorsByExporter <- err
+		}(exporter)
+	}
+	close(start)
+	for range 2 {
+		if err := <-errorsByExporter; err != nil {
+			t.Fatalf("ExportSnapshot() concurrent error = %v", err)
+		}
+	}
+	contents, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("ReadFile(manifest) error = %v", err)
+	}
+	var manifest Manifest
+	if err := json.Unmarshal(contents, &manifest); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	fileHash, err := fileSHA256(snapshotPath)
+	if err != nil {
+		t.Fatalf("fileSHA256() error = %v", err)
+	}
+	if manifest.FileSHA256 != fileHash {
+		t.Fatalf("published pair mismatch: manifest %s, snapshot %s", manifest.FileSHA256, fileHash)
+	}
+	for _, lockPath := range []string{snapshotPath + ".sit-lock", manifestPath + ".sit-lock"} {
+		if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+			t.Fatalf("lock path remains after export: %s (%v)", lockPath, err)
+		}
 	}
 }

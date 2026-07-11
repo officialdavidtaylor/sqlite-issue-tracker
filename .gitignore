@@ -1,4 +1,8 @@
 *.sqlite-wal
 *.sqlite-shm
 *.sqlite-journal
+*.sit-lock/
+.sit-backup-*
+.snapshot-*.sqlite
+.manifest-*.json
 /sit

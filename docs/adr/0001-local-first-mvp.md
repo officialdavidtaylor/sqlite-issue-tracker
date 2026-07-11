@@ -24,6 +24,8 @@ The MVP separates live state from the versioned artifact:
 - `.issues/issues.sqlite` is created only through SQLite `VACUUM INTO`.
 - `.issues/manifest.json` records schema generation plus exact-file, logical
   state, and audit-history SHA-256 hashes.
+- Snapshot and manifest targets are protected by canonical path checks,
+  per-target publication locks, and rollback-capable pair installation.
 - `blocks` links are a directed acyclic graph; other relationship types may be
   cyclic.
 

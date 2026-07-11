@@ -23,8 +23,10 @@ const timeFormat = time.RFC3339Nano
 
 // Store owns the serialized SQLite connection used for all writes.
 type Store struct {
-	db  *sql.DB
-	now func() time.Time
+	db            *sql.DB
+	path          string
+	now           func() time.Time
+	hashTableHook func(string)
 }
 
 // Open creates or opens a store, configures SQLite, and applies migrations.
@@ -35,14 +37,18 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("create database directory: %w", err)
 	}
-	db, err := sql.Open("sqlite", path)
+	canonical, err := canonicalPath(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve database path: %w", err)
+	}
+	db, err := sql.Open("sqlite", canonical)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	store := &Store{db: db, now: func() time.Time { return time.Now().UTC() }}
+	store := &Store{db: db, path: canonical, now: func() time.Time { return time.Now().UTC() }}
 	if err := store.configure(ctx); err != nil {
 		db.Close()
 		return nil, err
@@ -59,17 +65,38 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) configure(ctx context.Context) error {
 	pragmas := []string{
-		"PRAGMA foreign_keys = ON",
 		"PRAGMA busy_timeout = 5000",
+		"PRAGMA foreign_keys = ON",
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA synchronous = NORMAL",
 	}
 	for _, statement := range pragmas {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+		if err := s.execPragma(ctx, statement); err != nil {
 			return fmt.Errorf("configure sqlite with %q: %w", statement, err)
 		}
 	}
 	return nil
+}
+
+func (s *Store) execPragma(ctx context.Context, statement string) error {
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	retry := time.NewTicker(10 * time.Millisecond)
+	defer retry.Stop()
+	for {
+		if _, err := s.db.ExecContext(ctx, statement); err == nil {
+			return nil
+		} else if !strings.Contains(err.Error(), "SQLITE_BUSY") && !strings.Contains(err.Error(), "database is locked") {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return errors.New("database remained locked for 5 seconds")
+		case <-retry.C:
+		}
+	}
 }
 
 func (s *Store) migrate(ctx context.Context) error {

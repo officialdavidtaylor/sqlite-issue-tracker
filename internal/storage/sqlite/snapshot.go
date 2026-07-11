@@ -47,7 +47,6 @@ func hashQuery(ctx context.Context, q querier, h hash.Hash, table, query string,
 	if err != nil {
 		return fmt.Errorf("hash %s: %w", table, err)
 	}
-	defer rows.Close()
 	for rows.Next() {
 		values := make([]sql.NullString, columns)
 		dest := make([]any, columns)
@@ -66,21 +65,37 @@ func hashQuery(ctx context.Context, q querier, h hash.Hash, table, query string,
 			}
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close %s hash rows: %w", table, err)
+	}
+	return nil
 }
 
-func computeHashes(ctx context.Context, q querier) (Hashes, error) {
+func computeHashes(ctx context.Context, q querier, afterTable func(string)) (Hashes, error) {
 	state := sha256.New()
 	if err := hashQuery(ctx, q, state, "schema_migrations", `SELECT version FROM schema_migrations ORDER BY version`, 1); err != nil {
 		return Hashes{}, err
+	}
+	if afterTable != nil {
+		afterTable("schema_migrations")
 	}
 	if err := hashQuery(ctx, q, state, "issues", `SELECT id, title, body, status, revision, created_at, updated_at, deleted_at
 FROM issues ORDER BY id`, 8); err != nil {
 		return Hashes{}, err
 	}
+	if afterTable != nil {
+		afterTable("issues")
+	}
 	if err := hashQuery(ctx, q, state, "issue_links", `SELECT source_issue_id, target_issue_id, relationship, created_at
 FROM issue_links ORDER BY source_issue_id, target_issue_id, relationship`, 4); err != nil {
 		return Hashes{}, err
+	}
+	if afterTable != nil {
+		afterTable("issue_links")
 	}
 
 	history := sha256.New()
@@ -88,15 +103,38 @@ FROM issue_links ORDER BY source_issue_id, target_issue_id, relationship`, 4); e
 expected_revision, resulting_revision, payload, occurred_at FROM audit_events ORDER BY event_id`, 10); err != nil {
 		return Hashes{}, err
 	}
+	if afterTable != nil {
+		afterTable("audit_events")
+	}
 	return Hashes{
 		StateSHA256:   hex.EncodeToString(state.Sum(nil)),
 		HistorySHA256: hex.EncodeToString(history.Sum(nil)),
 	}, nil
 }
 
+func computeHashesInReadTransaction(ctx context.Context, db *sql.DB, afterTable func(string)) (result Hashes, err error) {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return Hashes{}, fmt.Errorf("acquire hash connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+		return Hashes{}, fmt.Errorf("begin hash transaction: %w", err)
+	}
+	defer func() { _, _ = conn.ExecContext(context.Background(), "ROLLBACK") }()
+	result, err = computeHashes(ctx, immediateConn{conn: conn}, afterTable)
+	if err != nil {
+		return Hashes{}, err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return Hashes{}, fmt.Errorf("commit hash transaction: %w", err)
+	}
+	return result, nil
+}
+
 // Hashes returns deterministic hashes over canonical logical rows.
 func (s *Store) Hashes(ctx context.Context) (Hashes, error) {
-	return computeHashes(ctx, s.db)
+	return computeHashesInReadTransaction(ctx, s.db, s.hashTableHook)
 }
 
 // IntegrityCheck runs SQLite's full database integrity check.
@@ -150,8 +188,27 @@ func (s *Store) ExportSnapshot(ctx context.Context, outputPath, manifestPath str
 	if outputPath == "" || manifestPath == "" {
 		return Manifest{}, fmt.Errorf("snapshot and manifest paths are required")
 	}
-	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
-		return Manifest{}, fmt.Errorf("create snapshot directory: %w", err)
+	outputPath, manifestPath, err := validateArtifactPaths(s.path, outputPath, manifestPath)
+	if err != nil {
+		return Manifest{}, err
+	}
+	for _, directory := range uniqueDirectories(outputPath, manifestPath) {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			return Manifest{}, fmt.Errorf("create artifact directory %q: %w", directory, err)
+		}
+	}
+	outputPath, manifestPath, err = validateArtifactPaths(s.path, outputPath, manifestPath)
+	if err != nil {
+		return Manifest{}, err
+	}
+	releaseLocks, err := acquireTargetLocks(ctx, outputPath, manifestPath)
+	if err != nil {
+		return Manifest{}, err
+	}
+	defer releaseLocks()
+	outputPath, manifestPath, err = validateArtifactPaths(s.path, outputPath, manifestPath)
+	if err != nil {
+		return Manifest{}, err
 	}
 	placeholder, err := os.CreateTemp(filepath.Dir(outputPath), ".snapshot-*.sqlite")
 	if err != nil {
@@ -181,7 +238,7 @@ func (s *Store) ExportSnapshot(ctx context.Context, outputPath, manifestPath str
 	if err := integrityCheck(ctx, snapshotDB); err != nil {
 		return Manifest{}, fmt.Errorf("verify exported snapshot: %w", err)
 	}
-	hashes, err := computeHashes(ctx, snapshotDB)
+	hashes, err := computeHashesInReadTransaction(ctx, snapshotDB, nil)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -196,6 +253,9 @@ func (s *Store) ExportSnapshot(ctx context.Context, outputPath, manifestPath str
 	if err := snapshotDB.Close(); err != nil {
 		return Manifest{}, fmt.Errorf("close exported snapshot: %w", err)
 	}
+	if err := syncFile(temporaryPath); err != nil {
+		return Manifest{}, fmt.Errorf("sync exported snapshot: %w", err)
+	}
 	fileHash, err := fileSHA256(temporaryPath)
 	if err != nil {
 		return Manifest{}, err
@@ -208,43 +268,54 @@ func (s *Store) ExportSnapshot(ctx context.Context, outputPath, manifestPath str
 		HistorySHA256: hashes.HistorySHA256,
 		CreatedAt:     s.now().Format(time.RFC3339Nano),
 	}
-	if err := os.Rename(temporaryPath, outputPath); err != nil {
-		return Manifest{}, fmt.Errorf("install snapshot: %w", err)
+	temporaryManifest, err := prepareManifest(manifestPath, manifest)
+	if err != nil {
+		return Manifest{}, err
 	}
-	if err := writeManifest(manifestPath, manifest); err != nil {
+	defer os.Remove(temporaryManifest)
+	if err := publishPair(temporaryPath, temporaryManifest, outputPath, manifestPath, os.Rename); err != nil {
 		return Manifest{}, err
 	}
 	return manifest, nil
 }
 
-func writeManifest(path string, manifest Manifest) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create manifest directory: %w", err)
-	}
+func prepareManifest(path string, manifest Manifest) (string, error) {
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".manifest-*.json")
 	if err != nil {
-		return fmt.Errorf("create manifest: %w", err)
+		return "", fmt.Errorf("create manifest: %w", err)
 	}
 	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
+	prepared := false
+	defer func() {
+		if !prepared {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
 	encoder := json.NewEncoder(temporary)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(manifest); err != nil {
 		temporary.Close()
-		return fmt.Errorf("encode manifest: %w", err)
+		return "", fmt.Errorf("encode manifest: %w", err)
 	}
 	if err := temporary.Sync(); err != nil {
 		temporary.Close()
-		return fmt.Errorf("sync manifest: %w", err)
+		return "", fmt.Errorf("sync manifest: %w", err)
 	}
 	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("close manifest: %w", err)
+		return "", fmt.Errorf("close manifest: %w", err)
 	}
 	if err := os.Chmod(temporaryPath, 0o644); err != nil {
-		return fmt.Errorf("set manifest permissions: %w", err)
+		return "", fmt.Errorf("set manifest permissions: %w", err)
 	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return fmt.Errorf("install manifest: %w", err)
+	prepared = true
+	return temporaryPath, nil
+}
+
+func syncFile(path string) error {
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
 	}
-	return nil
+	defer file.Close()
+	return file.Sync()
 }

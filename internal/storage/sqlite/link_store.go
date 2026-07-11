@@ -27,8 +27,9 @@ func (s *Store) AddLink(ctx context.Context, params issue.LinkParams) error {
 		return fmt.Errorf("invalid relationship %q", params.Relationship)
 	}
 	hash, payload, err := requestHash(struct {
+		Operation                               string
 		SourceID, TargetID, Relationship, Actor string
-	}{params.SourceID, params.TargetID, params.Relationship, params.Actor})
+	}{"link", params.SourceID, params.TargetID, params.Relationship, params.Actor})
 	if err != nil {
 		return err
 	}
@@ -88,8 +89,9 @@ func (s *Store) RemoveLink(ctx context.Context, params issue.LinkParams) error {
 		return fmt.Errorf("invalid relationship %q", params.Relationship)
 	}
 	hash, payload, err := requestHash(struct {
+		Operation                               string
 		SourceID, TargetID, Relationship, Actor string
-	}{params.SourceID, params.TargetID, params.Relationship, params.Actor})
+	}{"unlink", params.SourceID, params.TargetID, params.Relationship, params.Actor})
 	if err != nil {
 		return err
 	}
