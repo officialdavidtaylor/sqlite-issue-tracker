@@ -53,3 +53,42 @@ func TestDiscover_SharesDatabaseAcrossWorktrees(t *testing.T) {
 		t.Fatalf("snapshot paths unexpectedly match: %q", primary.Snapshot)
 	}
 }
+
+func TestDiscover_UsesStandalonePathsOutsideGit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	directory := t.TempDir()
+	paths, err := Discover(context.Background(), directory)
+	if err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+	if paths.GitCommonDir != "" {
+		t.Fatalf("GitCommonDir = %q, want empty", paths.GitCommonDir)
+	}
+	if paths.Database != filepath.Join(directory, ".issues", "live.sqlite") {
+		t.Fatalf("Database = %q, want standalone path", paths.Database)
+	}
+}
+
+func TestDiscover_PropagatesMissingGitInsideRepository(t *testing.T) {
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git is not installed")
+	}
+	repository := filepath.Join(t.TempDir(), "repository")
+	if err := os.MkdirAll(repository, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(gitPath, "-C", repository, "init", "-b", "main")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init error = %v\n%s", err, output)
+	}
+	t.Setenv("PATH", t.TempDir())
+	if _, err := Discover(context.Background(), repository); err == nil {
+		t.Fatal("Discover() with missing Git error = nil")
+	}
+	if _, err := os.Stat(filepath.Join(repository, ".issues")); !os.IsNotExist(err) {
+		t.Fatalf("standalone directory was created after Git failure: %v", err)
+	}
+}
